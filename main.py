@@ -7,7 +7,7 @@ Variables de entorno (Railway -> Variables):
   DB_URL    mysql://usuario:contraseña@host:puerto/base   (obligatoria)
   USUARIOS  usuarios con clave, uno por línea o separados por ;  (obligatoria para cancelar)
             formato:  numero|NOMBRE|clave
-            ej.:      01|PRESIDENTE|1111;02|TESORERO|2222;03|SISTEMAS|3333
+            ej.:      01|PRESIDENTE|1111"
   PUEDEN_CANCELAR  números de usuario que pueden cancelar recibos (por defecto 01,02)
   MUNICIPIO  nombre que aparece en pantallas y reportes (por defecto Telchac Pueblo)
   SIGLAS     letras del escudo cuando no hay logo (por defecto TP)
