@@ -1039,6 +1039,17 @@ dialog::backdrop{background:rgba(30,10,15,.45)}
 .sol .montos{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-variant-numeric:tabular-nums}
 .sol .baja{color:var(--rojo);font-weight:700}
 .sol .motivo{font-size:14px;color:var(--gris);margin-top:6px}
+.medidas{width:100%;border-collapse:collapse;font-size:14px;margin-top:10px;font-variant-numeric:tabular-nums}
+.medidas th{font-size:12px;font-weight:600;color:var(--gris);text-align:right;padding:3px 8px;border-bottom:1px solid var(--linea)}
+.medidas td{padding:4px 8px;text-align:right;border-bottom:1px solid var(--linea)}
+.medidas th:first-child,.medidas td:first-child{text-align:left}
+.medidas tr.cambia td{background:#fdf1f1}
+.medidas tr.cambia td:nth-child(3){color:var(--rojo);font-weight:700}
+.medidas .flecha{font-size:12px;color:var(--rojo);white-space:nowrap}
+.jugada{margin-top:10px;padding:9px 12px;border-radius:5px;background:#fff6e5;border:1px solid #f0c674;font-size:14px;line-height:1.45}
+.jugada b.t{display:block;color:#8a5a00;font-size:12.5px;letter-spacing:.04em;margin-bottom:2px}
+.jugada ul{margin:2px 0 0;padding-left:18px}
+@media (max-width:600px){.medidas{font-size:13px}.medidas td,.medidas th{padding:3px 4px}}
 .estado{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px}
 .estado.APLICADO,.estado.AUTORIZADO{background:#E7F5EC;color:#145C38}
 .estado.RECHAZADO{background:#FBE9E7;color:var(--rojo)}
@@ -1447,9 +1458,56 @@ async function cargar() {
         <div class="montos"><span>Actual <b>${dinero(f.valor_catastral_ant)}</b></span><span>Nuevo <b>${dinero(f.valor_catastral_nva)}</b></span>
           <span class="baja">Baja ${dinero(f.diferencia)} (-${f.porcentaje}%)</span>
           ${f.status !== "PENDIENTE" ? `<span class="estado ${esc(f.status)}">${esc(f.status)}</span>` : ""}</div>
-        <div class="motivo">Motivo: ${esc(f.motivo)}</div>
+        ${tablaMedidas(f)}
+        ${laJugada(f)}
+        <div class="motivo">Motivo: ${esc(f.motivo)} · Solicitó: ${esc(f.solicitado_por || "—")}</div>
       </div>`).join("");
   } catch (e) { $("lista").innerHTML = `<div class="mensaje error">${esc(e.message)}</div>`; }
+}
+
+const num = v => Number(v || 0);
+const distinto = (a, b) => Math.abs(num(a) - num(b)) > 0.005;
+const signo = (d, fmt) => (d > 0 ? "+" : "−") + fmt(Math.abs(d)).replace("−", "");
+
+// Explica de dónde viene la baja: zona, medidas o tarifa
+function laJugada(f) {
+  const r = [];
+  const za = (f.seccion_ant || "").trim(), zn = (f.seccion_nva || "").trim();
+  const cambioZona = za.toUpperCase() !== zn.toUpperCase();
+  const dTer = num(f.sup_terreno_nva) - num(f.sup_terreno_ant);
+  const dCon = num(f.sup_const_nva) - num(f.sup_const_ant);
+  const dVT = num(f.valor_terreno_nva) - num(f.valor_terreno_ant);
+  const dVC = num(f.valor_const_nva) - num(f.valor_const_ant);
+
+  if (cambioZona) r.push(`Cambiaron la <b>ZONA</b>: de <b>${esc(za || "SIN ZONA")}</b> a <b>${esc(zn || "SIN ZONA")}</b> (cambia la tarifa por m²).`);
+  if (dTer < -0.005) r.push(`Bajaron la <b>superficie de TERRENO</b>: ${m2(f.sup_terreno_ant)} → ${m2(f.sup_terreno_nva)} (<b>${signo(dTer, m2)}</b>, ${Math.round(-dTer / (num(f.sup_terreno_ant) || 1) * 100)}% menos).`);
+  if (dCon < -0.005) r.push(`Bajaron la <b>superficie de CONSTRUCCIÓN</b>: ${m2(f.sup_const_ant)} → ${m2(f.sup_const_nva)} (<b>${signo(dCon, m2)}</b>${num(f.sup_const_nva) === 0 ? ", <b>la dejaron en CERO</b>" : ""}).`);
+  if (dTer > 0.005) r.push(`Subieron el terreno ${signo(dTer, m2)} (no es la causa de la baja).`);
+  if (dCon > 0.005) r.push(`Subieron la construcción ${signo(dCon, m2)} (no es la causa de la baja).`);
+  if (!cambioZona && Math.abs(dTer) <= 0.005 && Math.abs(dCon) <= 0.005)
+    r.push(`Las medidas y la zona son <b>las mismas</b>: la baja viene de la <b>TARIFA</b> de la zona. Revisar si alguien bajó la tarifa en el catálogo de secciones.`);
+
+  const partes = [];
+  if (Math.abs(dVT) > 0.005) partes.push(`terreno ${signo(dVT, dinero)}`);
+  if (Math.abs(dVC) > 0.005) partes.push(`construcción ${signo(dVC, dinero)}`);
+  if (partes.length) r.push(`En dinero: ${partes.join(" · ")}.`);
+  return `<div class="jugada"><b class="t">🔎 DE DÓNDE VIENE LA BAJA</b><ul>${r.map(x => `<li>${x}</li>`).join("")}</ul></div>`;
+}
+
+function tablaMedidas(f) {
+  const fila = (t, a, b, fmt, esTexto) => {
+    const cambia = esTexto ? String(a || "").trim().toUpperCase() !== String(b || "").trim().toUpperCase() : distinto(a, b);
+    const dif = !esTexto && cambia ? `<span class="flecha">${signo(num(b) - num(a), fmt)}</span>` : "";
+    return `<tr class="${cambia ? "cambia" : ""}"><td>${t}</td><td>${fmt(a)}</td><td>${fmt(b)}</td><td>${dif}</td></tr>`;
+  };
+  const z = v => esc(v || "SIN ZONA");
+  return `<table class="medidas"><thead><tr><th></th><th>Anterior</th><th>Nueva</th><th></th></tr></thead><tbody>
+    ${fila("Zona", f.seccion_ant, f.seccion_nva, z, true)}
+    ${fila("Sup. terreno", f.sup_terreno_ant, f.sup_terreno_nva, m2)}
+    ${fila("Sup. construcción", f.sup_const_ant, f.sup_const_nva, m2)}
+    ${fila("Valor terreno", f.valor_terreno_ant, f.valor_terreno_nva, dinero)}
+    ${fila("Valor construcción", f.valor_const_ant, f.valor_const_nva, dinero)}
+  </tbody></table>`;
 }
 
 function comparativa(f) {
@@ -1466,7 +1524,8 @@ function comparativa(f) {
     ${renglon("Valor construcción", f.valor_const_ant, f.valor_const_nva, dinero)}
     ${renglon("VALOR CATASTRAL", f.valor_catastral_ant, f.valor_catastral_nva, dinero, true)}
   </tbody></table>
-  <p style="margin:6px 0 0;font-size:15px" class="baja"><b style="color:var(--rojo)">Baja: ${dinero(f.diferencia)} (-${f.porcentaje}%)</b></p>`;
+  <p style="margin:6px 0 0;font-size:15px" class="baja"><b style="color:var(--rojo)">Baja: ${dinero(f.diferencia)} (-${f.porcentaje}%)</b></p>
+  ${laJugada(f)}`;
 }
 
 function abrir(f) {
