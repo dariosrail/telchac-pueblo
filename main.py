@@ -7,8 +7,9 @@ Variables de entorno (Railway -> Variables):
   DB_URL    mysql://usuario:contraseña@host:puerto/base   (obligatoria)
   USUARIOS  usuarios con clave, uno por línea o separados por ;  (obligatoria para cancelar)
             formato:  numero|NOMBRE|clave
-            ej.:      01|PRESIDENTE|1111"
+            ej.:      01|PRESIDENTE|1111;02|TESORERO|2222;03|SISTEMAS|3333
   PUEDEN_CANCELAR  números de usuario que pueden cancelar recibos (por defecto 01,02)
+  PUEDEN_AUTORIZAR números de usuario que autorizan predios (por defecto 01 = Presidente)
   MUNICIPIO  nombre que aparece en pantallas y reportes (por defecto Telchac Pueblo)
   SIGLAS     letras del escudo cuando no hay logo (por defecto TP)
   APP_PIN   una sola clave general, solo consulta (si no usas USUARIOS)
@@ -71,6 +72,9 @@ def archivo_logo():
             return ruta
     return None
 PUEDEN_CANCELAR = {x.strip() for x in os.getenv("PUEDEN_CANCELAR", "01,02").split(",") if x.strip()}
+PUEDEN_AUTORIZAR = {x.strip() for x in os.getenv("PUEDEN_AUTORIZAR", "01").split(",") if x.strip()}
+TABLA_AUTORIZACIONES = "KTARAU01"          # la crea el sistema de escritorio (catálogo de predios)
+TIPO_BAJA_VALOR = "BAJA DE VALOR CATASTRAL"
 _intentos = {}
 
 app = Flask(__name__)
@@ -403,6 +407,104 @@ def listar_cancelaciones(limite=200):
         conn.close()
 
 
+# ------------------------------------------------------------------ autorizaciones (KTARAU01)
+def _tabla_autorizaciones_existe(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s", [TABLA_AUTORIZACIONES])
+        return bool(cur.fetchone()["n"])
+
+
+def _fecha_hora(v):
+    return v.strftime("%d/%m/%Y %H:%M") if hasattr(v, "strftime") else str(v or "")
+
+
+def normalizar_autorizacion(r):
+    campos_num = ["sup_terreno_ant", "sup_terreno_nva", "sup_const_ant", "sup_const_nva",
+                  "valor_terreno_ant", "valor_terreno_nva", "valor_const_ant", "valor_const_nva",
+                  "valor_catastral_ant", "valor_catastral_nva", "diferencia"]
+    d = {k: num(r.get(k)) for k in campos_num}
+    for k in ("id", "tipo", "codigo", "numero_catastral", "propietario", "direccion", "seccion_ant",
+              "seccion_nva", "motivo", "solicitado_por", "status", "autorizado_por", "comentario_autoriza"):
+        d[k] = str(r.get(k) if r.get(k) is not None else "").strip()
+    d["fecha_solicitud"] = _fecha_hora(r.get("fecha_solicitud"))
+    d["fecha_autorizacion"] = _fecha_hora(r.get("fecha_autorizacion"))
+    ant = d["valor_catastral_ant"]
+    d["porcentaje"] = round(d["diferencia"] / ant * 100, 1) if ant else 0
+    return d
+
+
+def listar_autorizaciones(ver="pendientes", limite=150):
+    conn = conectar()
+    try:
+        if not _tabla_autorizaciones_existe(conn):
+            return []
+        where = "WHERE status = 'PENDIENTE'" if ver == "pendientes" else "WHERE status <> 'PENDIENTE'"
+        orden = "id ASC" if ver == "pendientes" else "COALESCE(fecha_autorizacion, fecha_solicitud) DESC"
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM `{TABLA_AUTORIZACIONES}` {where} ORDER BY {orden} LIMIT %s", [limite])
+            return [normalizar_autorizacion(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def contar_pendientes():
+    conn = conectar()
+    try:
+        if not _tabla_autorizaciones_existe(conn):
+            return 0
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS n FROM `{TABLA_AUTORIZACIONES}` WHERE status = 'PENDIENTE'")
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
+
+
+def resolver_autorizacion(id_sol, accion, quien, comentario, ip):
+    """accion = 'autorizar' | 'rechazar'. Al autorizar una baja de valor se aplica en KTARMA01
+    en la misma transacción y el predio queda libre."""
+    conn = conectar(escritura=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM `{TABLA_AUTORIZACIONES}` WHERE id = %s FOR UPDATE", [id_sol])
+            r = cur.fetchone()
+            if not r:
+                raise ErrorCancelacion("No se encontró la solicitud.", 404)
+            if str(r.get("status") or "").strip() != "PENDIENTE":
+                raise ErrorCancelacion(f"Esa solicitud ya fue resuelta ({r.get('status')}).", 409)
+
+            nota = (comentario or "")[:500]
+            if accion == "rechazar":
+                cur.execute(f"""UPDATE `{TABLA_AUTORIZACIONES}` SET status = 'RECHAZADO', autorizado_por = %s,
+                                fecha_autorizacion = NOW(), comentario_autoriza = %s WHERE id = %s""",
+                            [quien[:100], nota, id_sol])
+                estado = "RECHAZADO"
+            elif str(r.get("tipo") or TIPO_BAJA_VALOR).strip() == TIPO_BAJA_VALOR:
+                cur.execute("""UPDATE KTARMA01 SET seccion = %s, sup_terreno = %s, sup_construccion = %s,
+                                      valor_terreno = %s, valor_construccion = %s WHERE codigo = %s""",
+                            [r["seccion_nva"], r["sup_terreno_nva"], r["sup_const_nva"],
+                             r["valor_terreno_nva"], r["valor_const_nva"], r["codigo"]])
+                cur.execute(f"""UPDATE `{TABLA_AUTORIZACIONES}` SET status = 'APLICADO', autorizado_por = %s,
+                                fecha_autorizacion = NOW(), comentario_autoriza = %s,
+                                aplicado_por = %s, fecha_aplicado = NOW() WHERE id = %s""",
+                            [quien[:100], nota, f"WEB {quien}"[:100], id_sol])
+                estado = "APLICADO"
+            else:
+                # Otros tipos de solicitud (a futuro): solo se marca autorizada
+                cur.execute(f"""UPDATE `{TABLA_AUTORIZACIONES}` SET status = 'AUTORIZADO', autorizado_por = %s,
+                                fecha_autorizacion = NOW(), comentario_autoriza = %s WHERE id = %s""",
+                            [quien[:100], nota, id_sol])
+                estado = "AUTORIZADO"
+        conn.commit()
+        print(f"[autorizar] {estado} solicitud={id_sol} predio={r.get('codigo')} usuario={quien} ip={ip}", flush=True)
+        return estado
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def totales(filas):
     vig = [f for f in filas if not f["cancelado"]]
     return {
@@ -517,6 +619,29 @@ def usuario_actual():
     return u.get("nombre", "")
 
 
+def puede_autorizar():
+    u = session.get("usuario") or {}
+    return bool(USUARIOS) and u.get("num") in PUEDEN_AUTORIZAR
+
+
+def verificar_clave_propia(clave, prefijo):
+    """Confirma la clave del usuario en sesión, con bloqueo por intentos. Regresa None si está bien,
+    o una respuesta de error lista para devolver."""
+    u = session.get("usuario") or {}
+    llave = (ip_cliente(), f"{prefijo}:{u.get('num', '')}")
+    n, hasta = _intentos.get(llave, (0, 0))
+    if hasta > time.time():
+        return jsonify(error="Demasiados intentos con clave incorrecta. Espera 5 min."), 429
+    propio = USUARIOS.get(u.get("num", ""))
+    if not propio or not hmac.compare_digest(str(clave or "").strip(), propio["clave"]):
+        n += 1
+        _intentos[llave] = (n, time.time() + BLOQUEO_SEG if n >= MAX_INTENTOS else 0)
+        print(f"[{prefijo}] CLAVE INCORRECTA usuario={u.get('num')} ip={ip_cliente()} intento={n}", flush=True)
+        return jsonify(error="Tu clave no es correcta."), 403
+    _intentos.pop(llave, None)
+    return None
+
+
 def puede_cancelar():
     u = session.get("usuario") or {}
     return bool(USUARIOS) and u.get("num") in PUEDEN_CANCELAR
@@ -586,13 +711,70 @@ def api_cancelaciones():
         return jsonify(error=f"No se pudo leer la bitácora: {ex}"), 500
 
 
+@app.route("/autorizaciones")
+def pagina_autorizaciones():
+    if not puede_autorizar():
+        return redirect(url_for("inicio"))
+    return render_template_string(AUT_HTML, css=CSS, usuario=usuario_actual(), con_login=bool(USUARIOS or APP_PIN),
+                                  puede_cancelar=puede_cancelar(), puede_autorizar=True,
+                                  tiene_logo=bool(archivo_logo()), municipio=MUNICIPIO, siglas=SIGLAS)
+
+
+@app.route("/api/autorizaciones")
+def api_autorizaciones():
+    if not puede_autorizar():
+        return jsonify(error="No tienes permiso para autorizar predios."), 403
+    try:
+        return jsonify(filas=listar_autorizaciones(request.args.get("ver", "pendientes")))
+    except Exception as ex:
+        return jsonify(error=f"No se pudieron leer las solicitudes: {ex}"), 500
+
+
+@app.route("/api/autorizaciones/conteo")
+def api_autorizaciones_conteo():
+    if not puede_autorizar():
+        return jsonify(pendientes=0)
+    try:
+        return jsonify(pendientes=contar_pendientes())
+    except Exception:
+        return jsonify(pendientes=0)
+
+
+@app.route("/api/autorizaciones/<int:id_sol>/resolver", methods=["POST"])
+def api_resolver_autorizacion(id_sol):
+    if not puede_autorizar():
+        return jsonify(error="No tienes permiso para autorizar predios."), 403
+    if request.headers.get("X-Requested-With") != "fetch" or not request.is_json:
+        return jsonify(error="Solicitud no válida."), 400
+    datos = request.get_json(silent=True) or {}
+    accion = str(datos.get("accion", "")).strip()
+    comentario = re.sub(r"\s+", " ", str(datos.get("comentario", ""))).strip()
+    if accion not in ("autorizar", "rechazar"):
+        return jsonify(error="Acción no válida."), 400
+    if accion == "rechazar" and len(comentario) < 5:
+        return jsonify(error="Escribe por qué se rechaza."), 400
+    error = verificar_clave_propia(datos.get("clave", ""), "autorizar")
+    if error:
+        return error
+    u = session.get("usuario") or {}
+    quien = f"{u.get('num', '')} {u.get('nombre', '')}".strip()
+    try:
+        estado = resolver_autorizacion(id_sol, accion, quien, comentario.upper(), ip_cliente())
+    except ErrorCancelacion as ex:
+        return jsonify(error=str(ex)), ex.codigo
+    except Exception as ex:
+        print(f"[autorizar] ERROR solicitud={id_sol}: {ex}", flush=True)
+        return jsonify(error=f"No se pudo guardar, la solicitud quedó igual: {ex}"), 500
+    return jsonify(ok=True, estado=estado)
+
+
 # ------------------------------------------------------------------ rutas
 @app.route("/")
 def inicio():
     return render_template_string(PAGE_HTML, css=CSS, configurado=bool(DB_URL or DEMO_CSV),
                                   usuario=usuario_actual(), con_login=bool(USUARIOS or APP_PIN),
-                                  puede_cancelar=puede_cancelar(), tiene_logo=bool(archivo_logo()),
-                                  municipio=MUNICIPIO, siglas=SIGLAS)
+                                  puede_cancelar=puede_cancelar(), puede_autorizar=puede_autorizar(),
+                                  tiene_logo=bool(archivo_logo()), municipio=MUNICIPIO, siglas=SIGLAS)
 
 
 @app.route("/api/recibos")
@@ -845,6 +1027,30 @@ dialog::backdrop{background:rgba(30,10,15,.45)}
 .lbl-campo{display:block;font-size:14px;color:var(--gris);font-weight:600;margin:12px 0 5px}
 .area-motivo{height:76px;padding:10px 12px;resize:vertical;font-size:16px}
 .btn:disabled{opacity:.55;cursor:wait}
+.badge{display:inline-block;min-width:20px;padding:1px 6px;border-radius:10px;background:var(--rojo);color:#fff;font-size:12px;font-weight:700;text-align:center;margin-left:4px;vertical-align:1px}
+.tabs{display:inline-flex;border:1.5px solid #fff;border-radius:4px;overflow:hidden}
+.tabs button{background:transparent;color:#fff;border:0;padding:9px 18px;font:inherit;font-size:15px;cursor:pointer}
+.tabs button.on{background:#fff;color:var(--vino);font-weight:700}
+.sol{background:#fff;border-radius:6px;padding:14px 16px;border-left:5px solid var(--oro);box-shadow:0 1px 3px rgba(60,20,30,.08);cursor:pointer;margin-bottom:12px}
+.sol:hover{box-shadow:0 2px 8px rgba(60,20,30,.15)}
+.sol .arriba{display:flex;justify-content:space-between;gap:10px;font-size:13px;color:var(--gris)}
+.sol .tipo{font-weight:700;color:var(--rojo);letter-spacing:.03em}
+.sol .nombre{font-size:17px;font-weight:700;margin:6px 0 2px}
+.sol .montos{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-variant-numeric:tabular-nums}
+.sol .baja{color:var(--rojo);font-weight:700}
+.sol .motivo{font-size:14px;color:var(--gris);margin-top:6px}
+.estado{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px}
+.estado.APLICADO,.estado.AUTORIZADO{background:#E7F5EC;color:#145C38}
+.estado.RECHAZADO{background:#FBE9E7;color:var(--rojo)}
+.estado.CANCELADO{background:#EEE;color:var(--gris)}
+.comp{width:100%;border-collapse:collapse;font-size:14.5px;margin:6px 0 4px}
+.comp th,.comp td{padding:7px 8px;border-bottom:1px solid var(--linea);text-align:right;position:static}
+.comp th:first-child,.comp td:first-child{text-align:left;color:var(--gris)}
+.comp tr.cambia td{background:#FFF7ED;font-weight:700}
+.comp tr.cambia td.nuevo{color:var(--rojo)}
+.comp tr.total td{font-size:16px;border-top:2px solid var(--vino)}
+.btn-verde{background:var(--ok);color:#fff}
+.vacio{background:#fff;border-radius:6px;padding:40px 20px;text-align:center;color:var(--gris);font-size:17px}
 .form-folio{display:flex;gap:10px;margin-bottom:14px}
 .form-folio input,.campo-motivo{flex:1;height:42px;border:1px solid #ccc;border-radius:4px;padding:0 12px;font:inherit;font-size:17px;width:100%}
 .opcion-folio{display:block;width:100%;text-align:left;background:#fff;border:1px solid var(--linea);border-radius:4px;padding:10px 12px;margin-bottom:8px;font:inherit;cursor:pointer}
@@ -913,7 +1119,7 @@ PAGE_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
   <a class="marca" href="/">{% if tiene_logo %}<img class="logo-img" src="/logo" alt="Escudo de {{ municipio }}">{% else %}<div class="escudo">{{ siglas }}</div>{% endif %}
     <div><b>{{ municipio|upper }}</b><small>H. AYUNTAMIENTO</small></div></a>
   <div class="sesion">
-    <nav><a class="activo" href="/">RECIBOS</a></nav>
+    <nav><a class="activo" href="/">RECIBOS</a>{% if puede_autorizar %}<a href="/autorizaciones">AUTORIZAR <span class="badge" id="badgePend" hidden></span></a>{% endif %}</nav>
     {% if puede_cancelar %}<button type="button" class="btn-cancelar-rec" id="btnCancelarRec">Cancelar recibo</button>
     <button type="button" class="btn-bitacora" id="btnBitacora">Bitácora</button>{% endif %}
     {% if con_login %}
@@ -1172,6 +1378,165 @@ if (PUEDE_CANCELAR) $("btnCancelarRec").onclick = abrirCancelar;
 $("desde").value = $("hasta").value = hoyISO();
 if (window.innerWidth < 700) cambiarVista("tarjetas");
 buscar();
+if ($("badgePend")) fetch("/api/autorizaciones/conteo").then(r => r.json()).then(d => {
+  if (d.pendientes > 0) { $("badgePend").textContent = d.pendientes; $("badgePend").hidden = false; }
+}).catch(() => {});
+</script>
+</body></html>"""
+
+
+AUT_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Autorizar · {{ municipio }}</title>""" + FONTS + """
+{% if tiene_logo %}<link rel="icon" href="/logo">{% endif %}<style>{{ css|safe }}</style></head>
+<body>
+<header class="top"><div class="ancho">
+  <a class="marca" href="/">{% if tiene_logo %}<img class="logo-img" src="/logo" alt="Escudo de {{ municipio }}">{% else %}<div class="escudo">{{ siglas }}</div>{% endif %}
+    <div><b>{{ municipio|upper }}</b><small>H. AYUNTAMIENTO</small></div></a>
+  <div class="sesion">
+    <nav><a href="/">RECIBOS</a><a class="activo" href="/autorizaciones">AUTORIZAR <span class="badge" id="badgePend" hidden></span></a></nav>
+    {% if usuario %}<span class="quien">Usuario: <b>{{ usuario }}</b></span>{% endif %}
+    <a class="salir" href="/salir">Salir</a>
+  </div>
+</div></header>
+
+<section class="banda"><div class="ancho">
+  <h1>Predios por autorizar</h1>
+  <div class="tabs" role="group"><button type="button" id="tPend" class="on">Pendientes</button><button type="button" id="tHist">Historial</button></div>
+</div></section>
+
+<main><div class="ancho"><div id="lista"></div></div></main>
+
+<dialog id="dlg"><div class="dlg-cab"><h2 id="dlgTitulo"></h2>
+  <button type="button" aria-label="Cerrar" onclick="dlg.close()">×</button></div>
+  <div class="dlg-cuerpo" id="dlgCuerpo"></div></dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const dlg = $("dlg");
+let filas = [], ver = "pendientes";
+const dinero = n => "$" + Number(n || 0).toLocaleString("es-MX", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const m2 = n => Number(n || 0).toLocaleString("es-MX", {minimumFractionDigits: 2, maximumFractionDigits: 2}) + " m²";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function pedir(url) {
+  const r = await fetch(url);
+  if (r.status === 401) { location.href = "/entrar"; throw new Error("Sesión expirada"); }
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "Error al consultar");
+  return d;
+}
+
+async function cargar() {
+  $("lista").innerHTML = '<div class="mensaje">Cargando...</div>';
+  try {
+    const d = await pedir("/api/autorizaciones?ver=" + ver);
+    filas = d.filas;
+    if (ver === "pendientes") {
+      $("badgePend").textContent = filas.length; $("badgePend").hidden = !filas.length;
+    }
+    if (!filas.length) {
+      $("lista").innerHTML = `<div class="vacio">${ver === "pendientes" ? "✔ No hay predios pendientes de autorizar." : "Todavía no hay solicitudes resueltas."}</div>`;
+      return;
+    }
+    $("lista").innerHTML = filas.map((f, i) => `
+      <div class="sol" data-i="${i}" tabindex="0">
+        <div class="arriba"><span class="tipo">${esc(f.tipo)}</span><span>Solicitud #${esc(f.id)} · ${esc(f.fecha_solicitud)}</span></div>
+        <div class="nombre">${esc(f.propietario || "SIN NOMBRE")}</div>
+        <div style="font-size:14px;color:var(--gris)">Folio electrónico <b style="color:var(--tinta)">${esc(f.codigo)}</b> · Núm. catastral ${esc(f.numero_catastral || "—")}</div>
+        <div class="montos"><span>Actual <b>${dinero(f.valor_catastral_ant)}</b></span><span>Nuevo <b>${dinero(f.valor_catastral_nva)}</b></span>
+          <span class="baja">Baja ${dinero(f.diferencia)} (-${f.porcentaje}%)</span>
+          ${f.status !== "PENDIENTE" ? `<span class="estado ${esc(f.status)}">${esc(f.status)}</span>` : ""}</div>
+        <div class="motivo">Motivo: ${esc(f.motivo)}</div>
+      </div>`).join("");
+  } catch (e) { $("lista").innerHTML = `<div class="mensaje error">${esc(e.message)}</div>`; }
+}
+
+function comparativa(f) {
+  const renglon = (titulo, a, b, fmt, total) => {
+    const cambia = String(a) !== String(b);
+    return `<tr class="${cambia ? "cambia" : ""}${total ? " total" : ""}"><td>${titulo}</td><td>${fmt(a)}</td><td class="nuevo">${fmt(b)}</td></tr>`;
+  };
+  const txt = v => esc(v || "SIN ZONA");
+  return `<table class="comp"><thead><tr><th></th><th>Antes</th><th>Ahora</th></tr></thead><tbody>
+    ${renglon("Zona", f.seccion_ant, f.seccion_nva, txt)}
+    ${renglon("Sup. terreno", f.sup_terreno_ant, f.sup_terreno_nva, m2)}
+    ${renglon("Sup. construcción", f.sup_const_ant, f.sup_const_nva, m2)}
+    ${renglon("Valor terreno", f.valor_terreno_ant, f.valor_terreno_nva, dinero)}
+    ${renglon("Valor construcción", f.valor_const_ant, f.valor_const_nva, dinero)}
+    ${renglon("VALOR CATASTRAL", f.valor_catastral_ant, f.valor_catastral_nva, dinero, true)}
+  </tbody></table>
+  <p style="margin:6px 0 0;font-size:15px" class="baja"><b style="color:var(--rojo)">Baja: ${dinero(f.diferencia)} (-${f.porcentaje}%)</b></p>`;
+}
+
+function abrir(f) {
+  $("dlgTitulo").textContent = `Solicitud #${f.id}`;
+  const datos = `<dl class="det">
+      <dt>Tipo</dt><dd><b style="color:var(--rojo)">${esc(f.tipo)}</b></dd>
+      <dt>Folio electrónico</dt><dd><b>${esc(f.codigo)}</b></dd>
+      <dt>Núm. catastral</dt><dd>${esc(f.numero_catastral || "—")}</dd>
+      <dt>Propietario</dt><dd><b>${esc(f.propietario)}</b></dd>
+      <dt>Dirección</dt><dd>${esc(f.direccion || "—")}</dd>
+      <dt>Motivo</dt><dd>${esc(f.motivo)}</dd>
+      <dt>Solicitó</dt><dd>${esc(f.solicitado_por)} · ${esc(f.fecha_solicitud)}</dd>
+      ${f.status !== "PENDIENTE" ? `<dt>Resolvió</dt><dd><span class="estado ${esc(f.status)}">${esc(f.status)}</span> ${esc(f.autorizado_por)} · ${esc(f.fecha_autorizacion)}${f.comentario_autoriza ? "<br>" + esc(f.comentario_autoriza) : ""}</dd>` : ""}
+    </dl><h3>Cambios</h3>` + comparativa(f);
+  if (f.status !== "PENDIENTE") { $("dlgCuerpo").innerHTML = datos; dlg.showModal(); return; }
+  $("dlgCuerpo").innerHTML = datos + `
+    <form id="fResolver" style="margin-top:16px">
+      <label class="lbl-campo" for="inComent">Comentario (obligatorio si rechazas)</label>
+      <textarea id="inComent" class="campo-motivo area-motivo" maxlength="500" placeholder="Opcional al autorizar"></textarea>
+      <label class="lbl-campo" for="inClave">Confirma con tu clave</label>
+      <input id="inClave" class="campo-motivo" type="password" inputmode="numeric" autocomplete="off" required>
+      <div id="resMsg"></div>
+      <div class="acciones">
+        <button type="button" class="btn btn-rojo" id="btnRechazar">✖ Rechazar</button>
+        <button type="button" class="btn btn-verde" id="btnAutorizar">✔ Autorizar</button>
+      </div>
+    </form>`;
+  dlg.showModal();
+  $("btnAutorizar").onclick = () => resolver(f, "autorizar");
+  $("btnRechazar").onclick = () => resolver(f, "rechazar");
+}
+
+async function resolver(f, accion) {
+  const comentario = $("inComent").value.trim(), clave = $("inClave").value;
+  if (accion === "rechazar" && comentario.length < 5) { $("resMsg").innerHTML = '<div class="mensaje error">Escribe por qué se rechaza.</div>'; return; }
+  if (!clave) { $("resMsg").innerHTML = '<div class="mensaje error">Escribe tu clave.</div>'; return; }
+  const pregunta = accion === "autorizar"
+    ? `¿AUTORIZAR que el predio ${f.codigo} baje de ${dinero(f.valor_catastral_ant)} a ${dinero(f.valor_catastral_nva)}?\n\nSe aplicará de inmediato.`
+    : `¿RECHAZAR la solicitud #${f.id}? El predio se queda con su valor actual.`;
+  if (!confirm(pregunta)) return;
+  $("btnAutorizar").disabled = $("btnRechazar").disabled = true;
+  $("resMsg").innerHTML = '<div class="mensaje">Guardando...</div>';
+  try {
+    const r = await fetch(`/api/autorizaciones/${f.id}/resolver`, {method: "POST",
+      headers: {"Content-Type": "application/json", "X-Requested-With": "fetch"},
+      body: JSON.stringify({accion, comentario, clave})});
+    if (r.status === 401) { location.href = "/entrar"; return; }
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "No se pudo guardar");
+    $("dlgCuerpo").innerHTML = `<div class="ok-msg">${accion === "autorizar"
+      ? `✔ Solicitud #${f.id} AUTORIZADA. El predio ${esc(f.codigo)} ya quedó con el nuevo valor y libre para cobro.`
+      : `✖ Solicitud #${f.id} RECHAZADA. El predio ${esc(f.codigo)} se queda con su valor y queda libre para cobro.`}</div>
+      <div class="acciones"><button type="button" class="btn btn-gris" onclick="dlg.close()">Cerrar</button></div>`;
+    cargar();
+  } catch (e) {
+    $("btnAutorizar").disabled = $("btnRechazar").disabled = false;
+    $("inClave").value = "";
+    $("resMsg").innerHTML = `<div class="mensaje error">${esc(e.message)}</div>`;
+  }
+}
+
+function cambiarVer(v) {
+  ver = v; $("tPend").classList.toggle("on", v === "pendientes"); $("tHist").classList.toggle("on", v === "historial"); cargar();
+}
+$("tPend").onclick = () => cambiarVer("pendientes");
+$("tHist").onclick = () => cambiarVer("historial");
+$("lista").addEventListener("click", e => { const el = e.target.closest("[data-i]"); if (el) abrir(filas[+el.dataset.i]); });
+$("lista").addEventListener("keydown", e => { const el = e.target.closest("[data-i]"); if (el && e.key === "Enter") abrir(filas[+el.dataset.i]); });
+cargar();
+setInterval(() => { if (ver === "pendientes" && !dlg.open) cargar(); }, 60000);
 </script>
 </body></html>"""
 
