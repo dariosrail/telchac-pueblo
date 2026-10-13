@@ -560,6 +560,16 @@ def exigir_login():
     return redirect(url_for("login"))
 
 
+@app.after_request
+def sin_cache(resp):
+    """Páginas y datos siempre frescos: que el celular no muestre una versión vieja guardada."""
+    if resp.mimetype in ("text/html", "application/json"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
+
 @app.route("/entrar", methods=["GET", "POST"])
 def login():
     if not (USUARIOS or APP_PIN):
